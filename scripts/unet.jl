@@ -29,6 +29,11 @@ end
 
 function (@main)(args)
     opts = parseargs(args)
+    # XLA's allocator never returns memory, and after training it can grow to its cap (default 0.75 of
+    # free memory) during Lux inference, starving the PyTorch subprocesses which run afterwards.  Lux
+    # needs only ≈1.7 GB here; 0.5 leaves room for PyTorch on an 8 GB GPU.  The GPU client is created
+    # lazily so this takes effect if set before the first GPU run.
+    haskey(ENV, "XLA_REACTANT_GPU_MEM_FRACTION") || (PracticalLuxBench.Reactant.XLA.XLA_REACTANT_GPU_MEM_FRACTION[] = 0.5)
     b = if opts.quick
         UNetBenchmark(;
             imagesize=64,

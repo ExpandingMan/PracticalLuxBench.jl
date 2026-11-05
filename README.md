@@ -75,13 +75,18 @@ plotresults("unet")                                   # writes results/unet_{tra
   - `cudnn.benchmark` is enabled for the U-net, since XLA autotunes convolutions by default.
   - Inductor's on-disk caches are disabled so that results do not depend on previous runs.
   - Reactant's default preallocation of 75% of GPU memory is disabled so that the PyTorch
-    subprocess has room to run.
+    subprocess has room to run.  For the U-net, Reactant's GPU memory cap is also lowered to 50%
+    (set in `scripts/unet.jl` unless `XLA_REACTANT_GPU_MEM_FRACTION` is set), since XLA's allocator
+    does not return memory and could otherwise grow to leave too little for PyTorch.
 
 ## Results
 
 Results below are from an AMD Ryzen 7 3800X with an NVIDIA GeForce RTX 2080 SUPER (8 GB), using
-Julia 1.13.3, Lux 1.31.5, Reactant 0.2.305 and PyTorch 2.15.0 (CUDA 13.2).  The raw results are in
-`results/*.json`.
+Julia 1.13.3, Lux 1.31.5, Reactant 0.2.306 and PyTorch 2.15.0 (CUDA 13.2).  The raw results are in
+`results/*.json`.  The exact versions of all dependencies used are pinned in `Manifest.toml` for Julia
+and in `python/pyproject.toml` and `python/uv.lock` for python, so the results should be
+reproducible by running the benchmarks from this repository as is.  Results with other versions may
+differ, since both frameworks are under active development.
 
 ### MLP regression
 
@@ -90,19 +95,19 @@ Gaussian noise; 65,536 training samples, batch size 512, 30 epochs.
 
 | backend                | median epoch | final test MSE |
 |------------------------|-------------:|---------------:|
-| Lux+Reactant (GPU)     |      94 ms   |        0.0135  |
+| Lux+Reactant (GPU)     |      41 ms   |        0.0135  |
 | PyTorch+compile (GPU)  |     137 ms   |        0.0138  |
-| Lux+Reactant (CPU)     |     262 ms   |        0.0135  |
-| PyTorch+compile (CPU)  |     300 ms   |        0.0138  |
-| Lux, no Reactant (CPU) |     822 ms   |        0.0135  |
+| Lux+Reactant (CPU)     |     220 ms   |        0.0135  |
+| PyTorch+compile (CPU)  |     301 ms   |        0.0138  |
+| Lux, no Reactant (CPU) |     830 ms   |        0.0135  |
 
 - All five backends follow essentially the same loss curves.  The Lux backends agree with each other
   exactly, and PyTorch differs only through the order of minibatches.
-- Lux+Reactant is the fastest to train on both GPU and CPU.  Lux without Reactant is about 3× slower
-  than with it on the CPU.
-- For inference on the GPU, Lux has lower latency at small batch sizes (0.10 vs 0.15 ms at batch
-  size 1) and PyTorch at large ones (0.49 vs 0.54 ms at 8192).  On the CPU, Lux+Reactant is fastest
-  at large batch sizes (6.5 vs 11.4 ms at 8192).
+- Lux+Reactant is the fastest to train on both GPU and CPU: over 3× faster than PyTorch on the GPU
+  and about 25% faster on the CPU.  Lux without Reactant is about 4× slower than with it on the CPU.
+- For inference on the GPU, Lux has lower latency at small and medium batch sizes (0.07 vs 0.15 ms at
+  batch size 1) and PyTorch is slightly faster at the largest (0.49 vs 0.52 ms at 8192).  On the CPU,
+  Lux+Reactant is fastest at large batch sizes (6.4 vs 10.7 ms at 8192).
 - All predictions agree with the Float64 reference to within 8e-7 relative error.
 - The test MSE has not yet reached the noise floor (σ² = 0.0025) after 30 epochs; this does not
   affect the comparison.
@@ -120,19 +125,21 @@ normalization, max pooling and transposed convolutions.  Training uses 2048 imag
 
 | backend               | median epoch | final test mIoU | pixel accuracy |
 |-----------------------|-------------:|----------------:|---------------:|
-| Lux+Reactant (GPU)    |      4.83 s  |          0.969  |         99.8%  |
-| PyTorch+compile (GPU) |      4.10 s  |          0.973  |         99.9%  |
+| Lux+Reactant (GPU)    |      3.98 s  |          0.967  |         99.8%  |
+| PyTorch+compile (GPU) |      4.08 s  |          0.971  |         99.8%  |
 
 | batch size | Lux+Reactant inference | PyTorch+compile inference |
 |-----------:|-----------------------:|--------------------------:|
-|          1 |                 0.99 ms |                   1.07 ms |
-|          4 |                 2.88 ms |                   2.97 ms |
-|         16 |                 8.34 ms |                  10.69 ms |
-|         64 |                31.0 ms  |                  41.9 ms  |
+|          1 |                 1.07 ms |                   1.07 ms |
+|          4 |                 2.70 ms |                   2.96 ms |
+|         16 |                 8.34 ms |                  10.78 ms |
+|         64 |                31.4 ms  |                  42.7 ms  |
 
 - Both frameworks converge to the same quality.  The loss and mean IoU curves track each other
-  closely, and both segment the example test images essentially perfectly.
-- PyTorch trains about 15% faster per epoch.  Lux is faster for inference, by about 25% at batch size 64.
+  closely, and both segment the example test images essentially perfectly.  The test mIoU fluctuates
+  by about 0.01 from epoch to epoch for both, so the difference in final mIoU is not significant.
+- Training speed is about the same, with Lux about 2% faster per epoch.  Lux is faster for
+  inference, by about 25% at batch size 64.
 - Predictions agree with the Float64 reference to within 6e-7 relative error.
 - Startup takes longer with Lux (about 1.5 minutes before training starts in a fresh process,
   mostly one-time Julia compilation, compared to about 10 s for PyTorch).  This is a fixed cost that
@@ -145,10 +152,11 @@ normalization, max pooling and transposed convolutions.  Training uses 2048 imag
 
 - The results come from a single run on one machine.  The MLP CPU timings in particular may be
   affected by other load on the machine.
-- Lux benchmarks rely on two Reactant/Lux internals: reusing the compiled training step stored in
-  `TrainState.cache`, and the `Reactant.XLA.XLA_REACTANT_GPU_PREALLOCATE` setting (set in the
-  package `__init__` unless the `XLA_REACTANT_GPU_PREALLOCATE` environment variable is set).
-  These may change between versions.
+- Lux benchmarks rely on a few Reactant/Lux internals: reusing the compiled training step stored in
+  `TrainState.cache`, the `Reactant.XLA.XLA_REACTANT_GPU_PREALLOCATE` setting (set in the
+  package `__init__` unless the `XLA_REACTANT_GPU_PREALLOCATE` environment variable is set), and
+  the `Reactant.XLA.XLA_REACTANT_GPU_MEM_FRACTION` setting (see above).  These may change between
+  versions.
 - By design, neither framework is tuned.  For example, `torch.compile(mode="max-autotune")`,
   CUDA graphs, mixed precision and Reactant compile options are not explored, so either framework
   may do better with more effort.
